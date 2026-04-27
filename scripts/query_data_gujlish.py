@@ -56,6 +56,24 @@ NUMBER_WORDS = {
     "trijo": 3,
 }
 
+ORDINAL_WORDS = {
+    "pehlo": 1,
+    "phelo": 1,
+    "pratham": 1,
+    "prathama": 1,
+    "bijo": 2,
+    "bijo": 2,
+    "bijo": 2,
+    "trijo": 3,
+    "chotho": 4,
+    "panchmo": 5,
+    "chhatho": 6,
+    "satmo": 7,
+    "aathmo": 8,
+    "navmo": 9,
+    "dasmo": 10,
+}
+
 GUJLISH_TERM_ALIASES = {
     "aama": "આમાં",
     "ama": "આમાં",
@@ -80,6 +98,34 @@ SHLOK_TERMS = {
     "verse",
 }
 
+CHAPTER_TERMS = {
+    "adhyay",
+    "adhyaya",
+    "chapter",
+    "પ્રકરણ",
+    "અધ્યાય",
+}
+
+QUESTION_INTENT_PATTERNS = {
+    "chapter": [
+        r"\badyay\b",
+        r"\badhyay\b",
+        r"\badhyaya\b",
+        r"\badyaya\b",
+        r"\bchapter\b",
+        r"પ્રકરણ",
+        r"અધ્યાય",
+    ],
+    "meaning": [
+        r"su\s+kehva\s+mange\s+che",
+        r"shu\s+kehva\s+mange\s+che",
+        r"શું\s+કહેવા\s+માટે",
+        r"શું\s+કહેવા\s+માંગે\s+છે",
+        r"meaning",
+        r"matlab",
+    ],
+}
+
 
 def normalize_digits(text: str) -> str:
     translated = text
@@ -101,6 +147,25 @@ def extract_requested_number(query: str) -> int | None:
         if token in NUMBER_WORDS:
             return NUMBER_WORDS[token]
     return None
+
+
+def extract_requested_chapter_number(query: str) -> int | None:
+    normalized = normalize_digits(query.lower())
+    match = re.search(r"\b(?:chapter|adyay|adhyay|adhyaya|adyaya|અધ્યાય|પ્રકરણ)\s*(\d{1,3})\b", normalized)
+    if match:
+        return int(match.group(1))
+
+    tokens = re.findall(r"[a-zA-Z]+", normalized)
+    for token in tokens:
+        if token in ORDINAL_WORDS:
+            return ORDINAL_WORDS[token]
+    return None
+
+
+def is_chapter_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(re.search(pattern, lowered) for pattern in QUESTION_INTENT_PATTERNS["chapter"]) \
+        and any(re.search(pattern, lowered) for pattern in QUESTION_INTENT_PATTERNS["meaning"])
 
 
 def expand_gujlish_query(query: str) -> str:
@@ -141,6 +206,70 @@ def find_exact_shlok_lines(lines: Iterable[str], requested_number: int | None) -
     return hits
 
 
+def find_exact_shlok_blocks(lines: list[str], requested_number: int | None) -> list[str]:
+    if requested_number is None:
+        return []
+
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        normalized = normalize_digits(line)
+        if not contains_shlok_term(normalized):
+            continue
+        if not re.search(rf"\b{requested_number}\b", normalized):
+            continue
+
+        buffer = [line]
+        next_index = index + 1
+        while next_index < len(lines):
+            candidate = lines[next_index]
+            candidate_norm = normalize_digits(candidate)
+            # Stop at next shlok marker or clear section break.
+            if contains_shlok_term(candidate_norm) and re.search(r"\b\d+\b", candidate_norm):
+                break
+            if candidate.startswith("#"):
+                break
+            buffer.append(candidate)
+            # Keep block compact for CLI readability.
+            if len(buffer) >= 4:
+                break
+            next_index += 1
+
+        blocks.append("\n".join(buffer))
+
+    return blocks
+
+
+def find_exact_chapter_block(lines: list[str], requested_number: int | None) -> list[str]:
+    if requested_number is None:
+        return []
+
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        normalized = normalize_digits(line)
+        lower = normalized.lower()
+        if not any(term in lower for term in CHAPTER_TERMS):
+            continue
+        if not re.search(rf"\b{requested_number}\b", normalized):
+            continue
+
+        buffer = [line]
+        next_index = index + 1
+        while next_index < len(lines):
+            candidate = lines[next_index]
+            candidate_norm = normalize_digits(candidate)
+            candidate_lower = candidate_norm.lower()
+            if any(term in candidate_lower for term in CHAPTER_TERMS) and re.search(r"\b\d+\b", candidate_norm):
+                break
+            buffer.append(candidate)
+            if len(buffer) >= 8:
+                break
+            next_index += 1
+
+        blocks.append("\n".join(buffer))
+
+    return blocks
+
+
 def retrieve_verbatim_snippets(markdown_text: str, query: str, top_k: int = 3) -> list[str]:
     chunker = StructureAwareChunker(ChunkConfig(max_tokens=180, overlap_tokens=30))
     chunks = chunker.chunk_markdown(markdown_text, source_name="data_file")
@@ -157,6 +286,30 @@ def retrieve_verbatim_snippets(markdown_text: str, query: str, top_k: int = 3) -
     for chunk in result.retrieved_chunks:
         snippets.append(chunk.text)
     return snippets
+
+
+def keyword_line_search(markdown_text: str, query: str, top_k: int = 5) -> list[str]:
+    lines = line_stream(markdown_text)
+    if not lines:
+        return []
+
+    expanded_query = expand_gujlish_query(query)
+    query_terms = set(re.findall(r"\w+", expanded_query.lower(), flags=re.UNICODE))
+    query_terms = {term for term in query_terms if len(term) > 1}
+    if not query_terms:
+        return []
+
+    scored: list[tuple[float, str]] = []
+    for line in lines:
+        line_terms = set(re.findall(r"\w+", line.lower(), flags=re.UNICODE))
+        overlap = len(query_terms & line_terms)
+        if overlap == 0:
+            continue
+        score = overlap / max(len(query_terms), 1)
+        scored.append((score, line))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [line for _, line in scored[:top_k]]
 
 
 def load_pdf_markdown(pdf_path: Path, ocr_backend: str) -> str:
@@ -186,8 +339,8 @@ def load_pdf_markdown(pdf_path: Path, ocr_backend: str) -> str:
     if result.markdown.strip():
         return result.markdown
 
-    if direct_text.strip():
-        # Keep a last-resort path to at least return source text when OCR fails.
+    if direct_text.strip() and not looks_garbled(direct_text):
+        # Keep a last-resort path only when the embedded layer is clean.
         return direct_text
     return ""
 
@@ -218,13 +371,25 @@ def looks_garbled(text: str) -> bool:
     if not text.strip():
         return True
 
-    weird_chars = re.findall(r"[Ðð×ØÆ¤™¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ƒ‚„…†‡ˆ‰‹›œžŸ]", text)
+    weird_chars = re.findall(r"[Ðð×ØÆ¤™¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ƒ‚„…†‡ˆ‰‹›œžŸ]|[\u00C0-\u024F]", text)
     replacement_like = text.count("�")
+    indic_chars = len(re.findall(r"[\u0A80-\u0AFF\u0900-\u097F]", text))
     total_chars = max(len(text), 1)
     weird_ratio = (len(weird_chars) + replacement_like) / total_chars
+    indic_ratio = indic_chars / total_chars
 
     # Many Latin-only glyph artifacts from bad font mapping push this ratio high.
-    return weird_ratio > 0.03
+    return weird_ratio > 0.03 or (indic_ratio < 0.01 and weird_ratio > 0.01)
+
+
+def is_preferred_script_text(text: str) -> bool:
+    has_gujarati = bool(re.search(r"[\u0A80-\u0AFF]", text))
+    has_devanagari = bool(re.search(r"[\u0900-\u097F]", text))
+    return (has_gujarati or has_devanagari) and not looks_garbled(text)
+
+
+def filter_clean_script_lines(lines: Iterable[str]) -> list[str]:
+    return [line for line in lines if is_preferred_script_text(line)]
 
 
 def find_tesseract_binary() -> str | None:
@@ -250,28 +415,88 @@ def detect_data_file(data_dir: Path) -> Path:
     return candidates[0]
 
 
+def detect_transcript_file(data_dir: Path, pdf_file: Path | None = None) -> Path | None:
+    supported = ["*.txt", "*.md"]
+    candidates: list[Path] = []
+    for pattern in supported:
+        candidates.extend(sorted(data_dir.glob(pattern)))
+
+    if not candidates:
+        return None
+
+    if pdf_file is not None:
+        pdf_stem = pdf_file.stem.lower()
+        for candidate in candidates:
+            if pdf_stem in candidate.stem.lower() or candidate.stem.lower() in pdf_stem:
+                return candidate
+
+    for candidate in candidates:
+        if "transcript" in candidate.stem.lower() or "clean" in candidate.stem.lower():
+            return candidate
+
+    return candidates[0]
+
+
+def load_transcript_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore").strip()
+
+
 def answer_query(markdown_text: str, query: str) -> dict[str, list[str] | str]:
     lines = line_stream(markdown_text)
     number = extract_requested_number(query)
+    chapter_number = extract_requested_chapter_number(query)
+
+    if is_chapter_query(query):
+        chapter_blocks = filter_clean_script_lines(find_exact_chapter_block(lines, chapter_number))
+        if chapter_blocks:
+            return {
+                "mode": "exact-chapter-block",
+                "responses": chapter_blocks,
+            }
+
+        return {
+            "mode": "chapter-not-found",
+            "responses": [
+                "માફ કરશો, આ પ્રશ્ન માટે માગેલો અધ્યાય ફાઇલમાં મળ્યો નથી.",
+                "જો તમે સાચો ટ્રાન્સક્રિપ્ટ ઉમેરશો તો હું અધ્યાય પ્રમાણે જવાબ આપી શકીશ.",
+            ],
+        }
 
     if contains_shlok_term(query.lower()):
-        shlok_lines = find_exact_shlok_lines(lines, number)
+        shlok_blocks = filter_clean_script_lines(find_exact_shlok_blocks(lines, number))
+        if shlok_blocks:
+            return {
+                "mode": "exact-shlok-block",
+                "responses": shlok_blocks,
+            }
+
+        shlok_lines = filter_clean_script_lines(find_exact_shlok_lines(lines, number))
         if shlok_lines:
             return {
                 "mode": "exact-shlok-line",
                 "responses": shlok_lines,
             }
 
-    snippets = retrieve_verbatim_snippets(markdown_text, query, top_k=3)
+    snippets = filter_clean_script_lines(retrieve_verbatim_snippets(markdown_text, query, top_k=3))
     if snippets:
         return {
             "mode": "semantic-verbatim-snippet",
             "responses": snippets,
         }
 
+    keyword_hits = filter_clean_script_lines(keyword_line_search(markdown_text, query, top_k=5))
+    if keyword_hits:
+        return {
+            "mode": "keyword-line-match",
+            "responses": keyword_hits,
+        }
+
     return {
-        "mode": "not-found",
-        "responses": ["No matching text found in the file."],
+        "mode": "not-found-or-low-quality",
+        "responses": [
+            "માફ કરશો, આ PDF માંથી હાલમાં સાફ ગુજરાતી/દેવનાગરી ટેક્સ્ટ મળ્યો નથી.",
+            "કૃપા કરીને વધુ સારી સ્કેન ફાઇલ આપો અથવા OCR backend easyocr/paddleocr થી ફરી ચલાવો.",
+        ],
     }
 
 
@@ -297,13 +522,22 @@ def main() -> None:
     args = parser.parse_args()
 
     data_file = detect_data_file(args.data_dir)
-    print(f"Using file: {data_file.name}")
-    markdown_text = load_pdf_markdown(data_file, ocr_backend=args.ocr_backend)
+    transcript_file = detect_transcript_file(args.data_dir, pdf_file=data_file)
+
+    if transcript_file is not None:
+        print(f"Using transcript: {transcript_file.name}")
+        markdown_text = load_transcript_text(transcript_file)
+    else:
+        print(f"Using file: {data_file.name}")
+        markdown_text = load_pdf_markdown(data_file, ocr_backend=args.ocr_backend)
 
     if not markdown_text.strip():
-        raise RuntimeError(
-            "Could not extract text from the PDF. Ensure OCR dependencies are installed and the scan is readable."
-        )
+        print("Mode: extraction-failed")
+        print("Output from file:")
+        print("----------------------------------------")
+        print("માફ કરશો, આ ફાઇલમાંથી વાંચી શકાય એવો સાફ લખાણ મળ્યો નથી.")
+        print("કૃપા કરીને /data માં UTF-8 transcript.txt અથવા .md ઉમેરો, અથવા વધુ સ્પષ્ટ PDF/ઈમેજ આપો.")
+        return
 
     if args.query:
         print_answer(answer_query(markdown_text, args.query))
