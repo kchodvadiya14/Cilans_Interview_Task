@@ -1,0 +1,13 @@
+pillow
+numpy
+pymupdf
+pytesseract
+sentence-transformers
+faiss-cpu
+scikit-learn
+
+# Optional OCR backends for stronger real-world scans.
+# easyocr
+# paddleocr
+# opencv-python
+# openai
