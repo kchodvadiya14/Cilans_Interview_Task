@@ -1,10 +1,12 @@
 pillow
+python-dotenv
 numpy
 pymupdf
 pytesseract
 sentence-transformers
 faiss-cpu
 scikit-learn
+google-generativeai
 
 # Optional OCR backends for stronger real-world scans.
 # easyocr

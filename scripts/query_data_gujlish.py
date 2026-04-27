@@ -8,20 +8,23 @@ Usage examples:
 from __future__ import annotations
 
 from argparse import ArgumentParser
+import importlib
 from pathlib import Path
+import os
 import re
 import shutil
 import sys
 from typing import Iterable
 
-try:
-    import fitz  # PyMuPDF
-except Exception:  # pragma: no cover - optional dependency
-    fitz = None
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:
+    pass
 
 from src.chunking import ChunkConfig, StructureAwareChunker
 from src.document_understanding import DocumentProcessor, OCRConfig
@@ -125,6 +128,20 @@ QUESTION_INTENT_PATTERNS = {
         r"matlab",
     ],
 }
+
+
+def _load_fitz_module():
+    try:
+        return importlib.import_module("fitz")
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+
+
+def _load_gemini_module():
+    try:
+        return importlib.import_module("google.generativeai")
+    except Exception:  # pragma: no cover - optional dependency
+        return None
 
 
 def normalize_digits(text: str) -> str:
@@ -352,6 +369,7 @@ def extract_text_directly_from_pdf(pdf_path: Path) -> str:
     This path keeps answers closer to the original source text.
     """
 
+    fitz = _load_fitz_module()
     if fitz is None:
         return ""
 
@@ -501,6 +519,13 @@ def answer_query(markdown_text: str, query: str) -> dict[str, list[str] | str]:
 
 
 def print_answer(answer: dict[str, list[str] | str]) -> None:
+    llm_answer = answer.get("llm_answer")
+    if isinstance(llm_answer, str) and llm_answer.strip():
+        print("LLM Answer:")
+        print("----------------------------------------")
+        print(llm_answer.strip())
+        print()
+
     print(f"Mode: {answer['mode']}")
     print("Output from file:")
     for item in answer["responses"]:
@@ -508,11 +533,73 @@ def print_answer(answer: dict[str, list[str] | str]) -> None:
         print(item)
 
 
+def generate_gemini_answer(
+    query: str,
+    evidence_lines: list[str],
+    api_key: str,
+    model_name: str,
+) -> str:
+    genai = _load_gemini_module()
+    if genai is None:
+        raise RuntimeError(
+            "Gemini dependency missing. Install with: pip install google-generativeai"
+        )
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+    evidence = "\n\n".join(evidence_lines)
+
+    prompt = (
+        "તમે બહુ કાળજીપૂર્વક જવાબ આપતા પુસ્તક સહાયક છો.\n"
+        "ફક્ત આપેલ Evidence પરથી જ જવાબ આપો.\n"
+        "જો જવાબ ન મળે તો સ્પષ્ટ કહો: 'આ માહિતી આપવામાં આવેલી ફાઇલમાં ઉપલબ્ધ નથી.'\n"
+        "જવાબ ગુજરાતી માં આપો.\n\n"
+        f"પ્રશ્ન: {query}\n\n"
+        f"Evidence:\n{evidence}\n"
+    )
+
+    response = model.generate_content(prompt)
+    text = getattr(response, "text", "") or ""
+    return text.strip()
+
+
+def maybe_apply_llm(
+    answer: dict[str, list[str] | str],
+    query: str,
+    use_llm: bool,
+    api_key: str,
+    model_name: str,
+) -> dict[str, list[str] | str]:
+    if not use_llm:
+        return answer
+
+    evidence = answer.get("responses", [])
+    if not isinstance(evidence, list) or not evidence:
+        return answer
+
+    if not api_key:
+        answer["llm_error"] = "GEMINI_API_KEY missing. Showing file-grounded output only."
+        return answer
+
+    try:
+        llm_answer = generate_gemini_answer(query, [str(item) for item in evidence], api_key, model_name)
+        if llm_answer:
+            answer["llm_answer"] = llm_answer
+            answer["mode"] = f"{answer['mode']}+gemini"
+    except Exception as exc:
+        answer["llm_error"] = f"Gemini failed: {exc}"
+
+    return answer
+
+
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Query the textbook in Gujlish and return file-grounded text.")
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data", help="Directory that contains the PDF file")
     parser.add_argument("--query", type=str, default="", help="Single query to run")
     parser.add_argument("--ocr-backend", type=str, default="tesseract", choices=["tesseract", "easyocr", "paddleocr"], help="OCR engine")
+    parser.add_argument("--use-llm", action="store_true", help="Generate final Gujarati answer with Gemini using retrieved evidence")
+    parser.add_argument("--llm-model", type=str, default="gemini-1.5-flash", help="Gemini model name")
+    parser.add_argument("--gemini-api-key", type=str, default="", help="Gemini API key (or set GEMINI_API_KEY env var)")
     parser.add_argument("--interactive", action="store_true", help="Start interactive query mode")
     return parser
 
@@ -539,8 +626,21 @@ def main() -> None:
         print("કૃપા કરીને /data માં UTF-8 transcript.txt અથવા .md ઉમેરો, અથવા વધુ સ્પષ્ટ PDF/ઈમેજ આપો.")
         return
 
+    gemini_api_key = (args.gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+
     if args.query:
-        print_answer(answer_query(markdown_text, args.query))
+        answer = answer_query(markdown_text, args.query)
+        answer = maybe_apply_llm(
+            answer=answer,
+            query=args.query,
+            use_llm=args.use_llm,
+            api_key=gemini_api_key,
+            model_name=args.llm_model,
+        )
+        if "llm_error" in answer:
+            print(f"Note: {answer['llm_error']}")
+            print()
+        print_answer(answer)
         return
 
     if args.interactive:
@@ -551,7 +651,18 @@ def main() -> None:
                 continue
             if user_query.lower() in {"exit", "quit"}:
                 break
-            print_answer(answer_query(markdown_text, user_query))
+            answer = answer_query(markdown_text, user_query)
+            answer = maybe_apply_llm(
+                answer=answer,
+                query=user_query,
+                use_llm=args.use_llm,
+                api_key=gemini_api_key,
+                model_name=args.llm_model,
+            )
+            if "llm_error" in answer:
+                print(f"Note: {answer['llm_error']}")
+                print()
+            print_answer(answer)
         return
 
     parser.error("Provide --query or use --interactive")

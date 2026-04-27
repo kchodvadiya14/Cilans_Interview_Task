@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.tessdata/eng.traineddata
+.tessdata/osd.traineddata
